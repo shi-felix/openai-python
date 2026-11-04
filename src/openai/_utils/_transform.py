@@ -151,6 +151,90 @@ def _no_transform_needed(annotation: type) -> bool:
     return annotation == float or annotation == int
 
 
+@lru_cache(maxsize=8096)
+def _contains_property_info(type_: object) -> bool | None:
+    """Whether the given type's annotations contain any `PropertyInfo` metadata.
+
+    Returns:
+        * `True` when the type carries `PropertyInfo` metadata (aliases,
+          formats or discriminators) anywhere in its structure;
+        * `False` when it provably does not **and** transforming matching data
+          is an identity function for every possible value (i.e. the type is
+          "closed": no bare containers, no `Any`/`object`, nothing that can
+          hide a pydantic model needing `model_dump`);
+        * `None` when the answer cannot be decided from the type alone
+          (bare `list`/`dict`/`Any`/`object`), in which case callers must
+          fall back to the regular recursive transform.
+
+    The result is cached per type, so that data matching a metadata-free type
+    can skip the full walk of the data entirely (see GH openai/openai-python
+    #4021 for why that matters for large bodies).
+    """
+    if isinstance(type_, PropertyInfo):
+        return True
+
+    if type_ is Any or type_ is object:
+        return None
+
+    if isinstance(type_, type) and issubclass(type_, pydantic.BaseModel):
+        # models are model_dump'ed (possibly excluding `__api_exclude__`
+        # fields), which is not an identity function
+        return None
+
+    if is_annotated_type(type_):
+        args = get_args(type_)
+        if any(isinstance(arg, PropertyInfo) for arg in args[1:]):
+            return True
+        return _contains_property_info(args[0])
+
+    if is_required_type(type_) or is_not_required_type(type_):
+        return _contains_property_info(get_args(type_)[0])
+
+    if is_typeddict(type_):
+        undecided = False
+        for field_type in get_type_hints(type_, include_extras=True).values():
+            result = _contains_property_info(field_type)
+            if result is True:
+                return True
+            if result is None:
+                undecided = True
+        if undecided:
+            return None
+        return False
+
+    origin = get_origin(type_)
+    if origin is None:
+        if type_ in (list, dict, tuple, set, frozenset):
+            # bare container classes: their contents are undecidable (they
+            # may hold pydantic models that need model_dump)
+            return None
+        return False
+
+    if is_union_type(type_):
+        results = [_contains_property_info(subtype) for subtype in get_args(type_)]
+        if any(r is True for r in results):
+            return True
+        if any(r is None for r in results):
+            return None
+        return False
+
+    # container types: for list[T] / Iterable[T] / Sequence[T] the item type
+    # (args[0]) can carry metadata; for dict[K, V] only the value type (and
+    # anything after the key arg) can. A bare container (no args) leaves the
+    # contents undecidable.
+    args = get_args(type_)
+    if not args:
+        return None
+    if origin == dict:
+        args = args[1:]
+    results = [_contains_property_info(arg) for arg in args]
+    if any(r is True for r in results):
+        return True
+    if any(r is None for r in results):
+        return None
+    return False
+
+
 def _transform_recursive(
     data: object,
     *,
@@ -182,7 +266,17 @@ def _transform_recursive(
     if origin == dict and is_mapping(data):
         args = get_args(stripped_type)
         items_type = args[1] if len(args) > 1 else object
-        return {key: _transform_recursive(value, annotation=items_type) for key, value in data.items()}
+        if not (
+            _contains_property_info(items_type) is False
+            # the outer `Annotated[..., PropertyInfo(format=...)]` applies to
+            # every value in the mapping, so it must be checked too
+            and _contains_property_info(annotation) is False
+        ):
+            # metadata may be reachable from here — walk the mapping
+            return {key: _transform_recursive(value, annotation=items_type) for key, value in data.items()}
+        # no `PropertyInfo` metadata reachable from here — keep the original
+        # mapping without walking it (GH#4021)
+        return data
 
     if (
         # List[T]
@@ -207,6 +301,16 @@ def _transform_recursive(
             if is_list(data):
                 return data
             return list(data)
+
+        if is_list(data) and (
+            _contains_property_info(inner_type) is False
+            # the outer `Annotated[..., PropertyInfo(format=...)]` applies to
+            # every entry of the list, so it must be checked too
+            and _contains_property_info(annotation) is False
+        ):
+            # no `PropertyInfo` metadata reachable from here — keep the
+            # original list without walking it (GH#4021)
+            return data
 
         return [_transform_recursive(d, annotation=annotation, inner_type=inner_type) for d in data]
 
@@ -266,6 +370,12 @@ def _transform_typeddict(
     data: Mapping[str, object],
     expected_type: type,
 ) -> Mapping[str, object]:
+    if _contains_property_info(expected_type) is False:
+        # the type is provably metadata-free and closed, so the transform is
+        # an identity function for any data matching it — return the input
+        # as-is instead of walking every value (GH#4021)
+        return data
+
     result: dict[str, object] = {}
     annotations = get_type_hints(expected_type, include_extras=True)
     for key, value in data.items():
@@ -350,7 +460,19 @@ async def _async_transform_recursive(
     if origin == dict and is_mapping(data):
         args = get_args(stripped_type)
         items_type = args[1] if len(args) > 1 else object
-        return {key: _transform_recursive(value, annotation=items_type) for key, value in data.items()}
+        if not (
+            _contains_property_info(items_type) is False
+            # the outer `Annotated[..., PropertyInfo(format=...)]` applies to
+            # every value in the mapping, so it must be checked too
+            and _contains_property_info(annotation) is False
+        ):
+            # metadata may be reachable from here — walk the mapping
+            # note: mirrors the upstream implementation, which reuses the sync
+            # recursive transform here
+            return {key: _transform_recursive(value, annotation=items_type) for key, value in data.items()}
+        # no `PropertyInfo` metadata reachable from here — keep the original
+        # mapping without walking it (GH#4021)
+        return data
 
     if (
         # List[T]
@@ -375,6 +497,16 @@ async def _async_transform_recursive(
             if is_list(data):
                 return data
             return list(data)
+
+        if is_list(data) and (
+            _contains_property_info(inner_type) is False
+            # the outer `Annotated[..., PropertyInfo(format=...)]` applies to
+            # every entry of the list, so it must be checked too
+            and _contains_property_info(annotation) is False
+        ):
+            # no `PropertyInfo` metadata reachable from here — keep the
+            # original list without walking it (GH#4021)
+            return data
 
         return [await _async_transform_recursive(d, annotation=annotation, inner_type=inner_type) for d in data]
 
@@ -434,6 +566,12 @@ async def _async_transform_typeddict(
     data: Mapping[str, object],
     expected_type: type,
 ) -> Mapping[str, object]:
+    if _contains_property_info(expected_type) is False:
+        # the type is provably metadata-free and closed, so the transform is
+        # an identity function for any data matching it — return the input
+        # as-is instead of walking every value (GH#4021)
+        return data
+
     result: dict[str, object] = {}
     annotations = get_type_hints(expected_type, include_extras=True)
     for key, value in data.items():
